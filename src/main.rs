@@ -6,6 +6,9 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(any(target_os = "linux"))]
+extern crate libc;
+
 use futures::stream::{self, SelectAll, StreamExt};
 use structopt::StructOpt;
 use tokio::io;
@@ -49,6 +52,47 @@ struct PrivDropConfig {
     /// Chroot to this directory
     #[structopt(long = "chroot")]
     chroot: Option<String>,
+}
+
+#[cfg(any(target_os = "linux"))]
+fn set_ulimit() -> () {
+    use std::io;
+
+    unsafe {
+        let mut rlim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) == -1 {
+            warn!("cannot get maxfiles limit: {}", io::Error::last_os_error());
+
+            return;
+        }
+
+        if rlim.rlim_cur < rlim_cur.rlim_max {
+            info!(
+                "set max open files from {} to {}",
+                rlim.rlim_cur, rlim.rlim_max
+            );
+
+            rlim.rlim_cur = rlim_cur.rlim_max;
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &mut rlim) == -1 {
+                warn!("cannot set maxfiles limit: {}", io::Error::last_os_error());
+
+                return;
+            }
+        } else {
+            info!(
+                "open files are already set to max allowed {}",
+                rlim.rlim_max
+            );
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux")))]
+fn set_ulimit() -> () {
+    info!("set open files limit is not supported for anything but linux");
 }
 
 async fn listen_socket(addr: SocketAddr) -> std::io::Result<TcpListenerStream> {
@@ -100,6 +144,9 @@ async fn main() {
         })
         .collect::<SelectAll<_>>()
         .await;
+
+    // Set limits before drop priv
+    set_ulimit();
 
     #[cfg(all(unix, feature = "drop_privs"))]
     let privdrop_enabled = [

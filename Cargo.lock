@@ -229,6 +229,7 @@ dependencies = [
  "async-stream",
  "env_logger",
  "futures",
+ "libc",
  "log",
  "privdrop",
  "structopt",
