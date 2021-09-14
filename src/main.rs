@@ -69,13 +69,13 @@ fn set_ulimit() -> () {
             return;
         }
 
-        if rlim.rlim_cur < rlim_cur.rlim_max {
+        if rlim.rlim_cur < rlim.rlim_max {
             info!(
                 "set max open files from {} to {}",
                 rlim.rlim_cur, rlim.rlim_max
             );
 
-            rlim.rlim_cur = rlim_cur.rlim_max;
+            rlim.rlim_cur = rlim.rlim_max;
             if libc::setrlimit(libc::RLIMIT_NOFILE, &mut rlim) == -1 {
                 warn!("cannot set maxfiles limit: {}", io::Error::last_os_error());
 
