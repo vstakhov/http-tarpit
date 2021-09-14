@@ -1,20 +1,20 @@
-use log::{warn, info};
 use log::LevelFilter;
+use log::{debug, info, warn};
 
 use std::net::SocketAddr;
-use std::time::Duration;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
-use structopt::StructOpt;
 use futures::stream::{self, SelectAll, StreamExt};
-use tokio::net::{TcpSocket};
-use tokio::time::{sleep, interval};
-use tokio_stream::wrappers::{TcpListenerStream};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use structopt::StructOpt;
 use tokio::io;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpSocket;
 use tokio::signal;
 use tokio::sync::broadcast;
+use tokio::time::{self, sleep, Instant};
+use tokio_stream::wrappers::TcpListenerStream;
 
 #[cfg(all(unix, feature = "drop_privs"))]
 use privdrop::PrivDrop;
@@ -62,8 +62,6 @@ async fn listen_socket(addr: SocketAddr) -> std::io::Result<TcpListenerStream> {
     sock.listen(128).map(TcpListenerStream::new)
 }
 
-
-
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let opts = Config::from_args();
@@ -81,10 +79,12 @@ async fn main() {
         .format_timestamp(Some(env_logger::fmt::TimestampPrecision::Millis))
         .init();
 
-    info!("http-tarpit has started; pid: {}, version: {}, delay: {}ms",
+    info!(
+        "http-tarpit has started; pid: {}, version: {}, delay: {}ms",
         std::process::id(),
         env!("CARGO_PKG_VERSION"),
-        delay.as_millis());
+        delay.as_millis()
+    );
 
     let mut listeners = stream::iter(opts.listen_addrs.iter())
         .then(|addr| async move {
@@ -102,9 +102,13 @@ async fn main() {
         .await;
 
     #[cfg(all(unix, feature = "drop_privs"))]
-        let privdrop_enabled = [&opts.privdrop.chroot, &opts.privdrop.user, &opts.privdrop.group]
-        .iter()
-        .any(|o| o.is_some());
+    let privdrop_enabled = [
+        &opts.privdrop.chroot,
+        &opts.privdrop.user,
+        &opts.privdrop.group,
+    ]
+    .iter()
+    .any(|o| o.is_some());
     if privdrop_enabled {
         let mut pd = PrivDrop::default();
         if let Some(path) = opts.privdrop.chroot {
@@ -128,8 +132,8 @@ async fn main() {
         info!("dropped privs");
     }
 
-    let total_conns : Arc<AtomicI32> = Arc::new(AtomicI32::new(0));
-    let num_clients : Arc<AtomicI32> = Arc::new(AtomicI32::new(0));
+    let total_conns: Arc<AtomicI32> = Arc::new(AtomicI32::new(0));
+    let num_clients: Arc<AtomicI32> = Arc::new(AtomicI32::new(0));
 
     loop {
         tokio::select! {
@@ -150,40 +154,56 @@ async fn main() {
                             num_clients.load(Ordering::Acquire));
 
                         let borrowed_num_clients = num_clients.clone();
+                        let mut shutdown_receiver = shut_send.subscribe();
+
                         tokio::spawn(async move {
                             let mut buf = vec![0; 1024];
                             let (mut rd, mut wr) = io::split(sock);
+                            let interval = time::sleep(delay);
+                            tokio::pin!(interval);
                             loop {
-                                match rd.read(&mut buf).await {
-                                    Ok(0) => {
-                                        // EOF
-                                        info!("disconnect before tarpit, remote: {}, current connections: {}",
-                                            peer,
-                                            borrowed_num_clients.load(Ordering::Acquire));
-                                        break;
-                                    },
-                                    Ok(n) => {
-                                        info!("read {} bytes, start tarpitting", n);
-                                        let mut interval = interval(delay);
-                                        interval.tick().await;
-                                        interval.tick().await;
+                                tokio::select!{
+                                    r = rd.read(&mut buf) => {
+                                        match r {
+                                            Ok(0) => {
+                                            // EOF
+                                                debug!("disconnect before tarpit, remote: {}, current connections: {}",
+                                                peer,
+                                                borrowed_num_clients.load(Ordering::Acquire));
+                                                break;
+                                            },
+                                            Ok(n) => {
+                                                let next_wakeup = Instant::now() + delay;
+                                                debug!("read {} bytes, start tarpitting; end at {:?}",
+                                                    n, next_wakeup);
+                                                interval.as_mut().reset(next_wakeup);
+                                            }
+                                            Err(e) => {
+                                                warn!("read failed, error: {:?}", e);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    _ = &mut interval => {
                                         match wr.write_all(b"HTTP/1.0 200 Delay OK\r\n").await {
                                             Ok(_) => {
                                                 info!("disconnect after tarpit, remote: {}, current connections: {}",
                                                     peer,
                                                     borrowed_num_clients.load(Ordering::Acquire));
+                                                break;
                                             }
                                             Err(e) => {
                                                 info!("write error during tarpig: {:?}", e);
+                                                break;
                                             }
                                         }
-                                        break;
                                     }
-                                    Err(e) => {
-                                        warn!("read failed, error: {:?}", e);
-                                        break;
+                                    _ = shutdown_receiver.recv() => {
+                                        info!("got termination signal, breaking tarpit for {}",
+                                                peer);
+                                        return;
                                     }
-                                };
+                                }
                             }
                             borrowed_num_clients.fetch_sub(1, Ordering::Release);
                         });
@@ -204,9 +224,19 @@ async fn main() {
                 info!("SIGINT received, send termination to {} threads",
                     num_clients.load(Ordering::Acquire));
                 shut_send.send(1).unwrap();
-                break;
             },
+            _ = shut_recv.recv() => {
+                // TODO:
+                // Allow threads to be terminated. This should be done by
+                // using bidirectional channels at some point...
+                let wait = Duration::from_millis(100);
+                sleep(wait).await;
+                break;
+            }
         }
     }
-    info!("terminating, {} connections served", total_conns.load(Ordering::Acquire));
+    info!(
+        "terminating, {} connections served",
+        total_conns.load(Ordering::Acquire)
+    );
 }
